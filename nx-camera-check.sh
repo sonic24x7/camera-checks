@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-BASE_URL="http://localhost:7001"
+BASE_URL="https://localhost:7001"
 
 # ── Colour codes ──────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -109,11 +109,34 @@ parse_schedule() {
     echo "${best_type}|${best_fps}|${best_bitrate}"
 }
 
-# ── Fetch devices ─────────────────────────────────────────────────────────────
+# ── Login — obtain bearer token ───────────────────────────────────────────────
 echo -e "${BOLD}Connecting to Nx Witness at ${BASE_URL}…${RESET}"
 
+LOGIN_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
+    -X POST "${BASE_URL}/rest/v3/login/sessions" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"${NX_USER}\",\"password\":\"${NX_PASS}\"}") || {
+    echo -e "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
+    exit 1
+}
+
+LOGIN_BODY=$(echo "$LOGIN_RESPONSE" | sed -n '/^__STATUS__/!p')
+LOGIN_CODE=$(echo "$LOGIN_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
+
+if [[ "$LOGIN_CODE" != "200" ]]; then
+    echo -e "${RED}ERROR: Login failed (HTTP ${LOGIN_CODE}). Check credentials.${RESET}" >&2
+    exit 1
+fi
+
+NX_TOKEN=$(extract "$LOGIN_BODY" "token")
+if [[ -z "$NX_TOKEN" ]]; then
+    echo -e "${RED}ERROR: Login succeeded but no token found in response.${RESET}" >&2
+    exit 1
+fi
+
+# ── Fetch devices ─────────────────────────────────────────────────────────────
 HTTP_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
-    -u "${NX_USER}:${NX_PASS}" \
+    -H "Authorization: Bearer ${NX_TOKEN}" \
     "${BASE_URL}/rest/v3/devices") || {
     echo -e "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
     exit 1
@@ -123,7 +146,7 @@ HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -n '/^__STATUS__/!p')
 HTTP_CODE=$(echo "$HTTP_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
 
 if [[ "$HTTP_CODE" == "401" ]]; then
-    echo -e "${RED}ERROR: Authentication failed (401). Check credentials.${RESET}" >&2
+    echo -e "${RED}ERROR: Authentication failed (401). Token may have expired.${RESET}" >&2
     exit 1
 elif [[ "$HTTP_CODE" != "200" ]]; then
     echo -e "${RED}ERROR: Unexpected HTTP ${HTTP_CODE} from API.${RESET}" >&2
