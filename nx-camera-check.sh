@@ -8,11 +8,11 @@ set +H  # Disable history expansion so ! in passwords is safe
 BASE_URL="https://localhost:7001"
 
 # ── Colour codes ──────────────────────────────────────────────────────────────
-GREEN=$'\033[0;32m'
-AMBER=$'\033[0;33m'
-RED=$'\033[0;31m'
-BOLD=$'\033[1m'
-RESET=$'\033[0m'
+GREEN=$'\e[0;32m'
+AMBER=$'\e[0;33m'
+RED=$'\e[0;31m'
+BOLD=$'\e[1m'
+RESET=$'\e[0m'
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 NX_USER=""
@@ -89,10 +89,10 @@ extract_stream_field() {
 map_codec() {
     local raw="$1"
     case "$raw" in
-        173|H264|AVC)  echo "H.264" ;;
-        174|H265|HEVC) echo "H.265" ;;
-        0)             echo "transcoded/unknown" ;;
-        *)             [[ -n "$raw" ]] && echo "unknown (${raw})" || echo "unknown" ;;
+        27|173|H264|AVC)   echo "H.264" ;;
+        174|265|H265|HEVC) echo "H.265" ;;
+        0)                 echo "transcoded/unknown" ;;
+        *)                 [[ -n "$raw" ]] && echo "unknown (${raw})" || echo "unknown" ;;
     esac
 }
 
@@ -126,13 +126,13 @@ parse_schedule() {
 }
 
 # ── Login — obtain bearer token ───────────────────────────────────────────────
-echo -e "${BOLD}Connecting to Nx Witness at ${BASE_URL}…${RESET}"
+printf "%s\n" "${BOLD}Connecting to Nx Witness at ${BASE_URL}…${RESET}"
 
 LOGIN_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
     -X POST "${BASE_URL}/rest/v3/login/sessions" \
     -H "Content-Type: application/json" \
     -d "{\"username\":\"${NX_USER}\",\"password\":\"${NX_PASS}\"}") || {
-    echo -e "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
     exit 1
 }
 
@@ -140,13 +140,13 @@ LOGIN_BODY=$(echo "$LOGIN_RESPONSE" | sed -n '/^__STATUS__/!p')
 LOGIN_CODE=$(echo "$LOGIN_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
 
 if [[ "$LOGIN_CODE" != "200" ]]; then
-    echo -e "${RED}ERROR: Login failed (HTTP ${LOGIN_CODE}). Check credentials.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: Login failed (HTTP ${LOGIN_CODE}). Check credentials.${RESET}" >&2
     exit 1
 fi
 
 NX_TOKEN=$(extract "$LOGIN_BODY" "token")
 if [[ -z "$NX_TOKEN" ]]; then
-    echo -e "${RED}ERROR: Login succeeded but no token found in response.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: Login succeeded but no token found in response.${RESET}" >&2
     exit 1
 fi
 
@@ -154,7 +154,7 @@ fi
 HTTP_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
     -H "Authorization: Bearer ${NX_TOKEN}" \
     "${BASE_URL}/rest/v3/devices") || {
-    echo -e "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: curl failed — is the server reachable?${RESET}" >&2
     exit 1
 }
 
@@ -162,10 +162,10 @@ HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -n '/^__STATUS__/!p')
 HTTP_CODE=$(echo "$HTTP_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
 
 if [[ "$HTTP_CODE" == "401" ]]; then
-    echo -e "${RED}ERROR: Authentication failed (401). Token may have expired.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: Authentication failed (401). Token may have expired.${RESET}" >&2
     exit 1
 elif [[ "$HTTP_CODE" != "200" ]]; then
-    echo -e "${RED}ERROR: Unexpected HTTP ${HTTP_CODE} from API.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: Unexpected HTTP ${HTTP_CODE} from API.${RESET}" >&2
     exit 1
 fi
 
@@ -174,7 +174,7 @@ fi
 # for awk-based splitting). We only need the id field from Camera entries.
 
 if ! command -v python3 &>/dev/null; then
-    echo -e "${RED}ERROR: python3 is required for JSON parsing.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: python3 is required for JSON parsing.${RESET}" >&2
     exit 1
 fi
 
@@ -189,18 +189,18 @@ except Exception as e:
     sys.stderr.write('JSON parse error: ' + str(e) + '\n')
     sys.exit(1)
 ") || {
-    echo -e "${RED}ERROR: Failed to parse device list JSON.${RESET}" >&2
+    printf "%s\n" "${RED}ERROR: Failed to parse device list JSON.${RESET}" >&2
     exit 1
 }
 
 DEVICE_COUNT=$(echo "$CAMERA_IDS" | grep -c '.') || true
 
 if [[ "$DEVICE_COUNT" -eq 0 ]]; then
-    echo -e "${AMBER}No cameras found in the response.${RESET}"
+    printf "%s\n" "${AMBER}No cameras found in the response.${RESET}"
     exit 0
 fi
 
-echo -e "${BOLD}Found ${DEVICE_COUNT} camera(s).${RESET}\n"
+printf "%s\n\n" "${BOLD}Found ${DEVICE_COUNT} camera(s).${RESET}"
 
 # ── Process each camera via individual API call ────────────────────────────────
 # Fetching /rest/v3/devices/{id} returns a single device object which is
@@ -215,7 +215,7 @@ while IFS= read -r cam_id; do
     DEV_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
         -H "Authorization: Bearer ${NX_TOKEN}" \
         "${BASE_URL}/rest/v3/devices/${cam_id}") || {
-        echo -e "${AMBER}WARNING: curl failed for device ${cam_id}, skipping.${RESET}" >&2
+        printf "%s\n" "${AMBER}WARNING: curl failed for device ${cam_id}, skipping.${RESET}" >&2
         continue
     }
 
@@ -223,7 +223,7 @@ while IFS= read -r cam_id; do
     DEV_CODE=$(echo "$DEV_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
 
     if [[ "$DEV_CODE" != "200" ]]; then
-        echo -e "${AMBER}WARNING: HTTP ${DEV_CODE} for device ${cam_id}, skipping.${RESET}" >&2
+        printf "%s\n" "${AMBER}WARNING: HTTP ${DEV_CODE} for device ${cam_id}, skipping.${RESET}" >&2
         continue
     fi
 
@@ -253,10 +253,16 @@ while IFS= read -r cam_id; do
     bitrate=$(echo "$sched_info"  | cut -d'|' -f3)
     quality=$(echo "$sched_info"  | cut -d'|' -f4)
 
-    # Resolution and codec — mediaStreams where encoderIndex=0 (primary recorded stream)
+    # Resolution — mediaStreams where encoderIndex=0 (primary recorded stream)
     media_streams_raw=$(echo "$device_json" | grep -oP '"mediaStreams"\s*:\s*\[\K[^\]]*' | head -1)
     resolution=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "resolution")
-    codec_raw=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "codec")
+
+    # Codec — prefer primaryStreamConfiguration.codec (plain string); fall back to
+    # mediaStreams[encoderIndex=0].codec (numeric FFmpeg ID)
+    codec_raw=$(echo "$device_json" | grep -oP '"primaryStreamConfiguration"\s*:\s*\{[^{]*"codec"\s*:\s*"\K[^"]+' | head -1)
+    if [[ -z "$codec_raw" ]]; then
+        codec_raw=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "codec")
+    fi
     codec=$(map_codec "$codec_raw")
     res_width=0
     if [[ "$resolution" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
@@ -281,7 +287,7 @@ while IFS= read -r cam_id; do
     fi
 
     # ── Print header ──────────────────────────────────────────────────────────
-    echo -e "${BOLD}=== Camera: ${cam_name} (${cam_ip}) ===${RESET}"
+    printf "%s\n" "${BOLD}=== Camera: ${cam_name} (${cam_ip}) ===${RESET}"
 
     cam_fail=0
     cam_warn=0
@@ -441,12 +447,12 @@ while IFS= read -r cam_id; do
 done <<< "$CAMERA_IDS"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-echo -e "${BOLD}────────────────────────────────────────${RESET}"
-echo -e "${BOLD}Summary:${RESET}"
-echo -e "  ${GREEN}OK   ${RESET}: ${PASS_COUNT} camera(s)"
-echo -e "  ${AMBER}WARN ${RESET}: ${WARN_COUNT} camera(s)"
-echo -e "  ${RED}FAIL ${RESET}: ${FAIL_COUNT} camera(s)"
-echo -e "${BOLD}────────────────────────────────────────${RESET}"
+printf "%s\n" "${BOLD}────────────────────────────────────────${RESET}"
+printf "%s\n" "${BOLD}Summary:${RESET}"
+printf "  %s: %s\n" "${GREEN}OK   ${RESET}" "${PASS_COUNT} camera(s)"
+printf "  %s: %s\n" "${AMBER}WARN ${RESET}" "${WARN_COUNT} camera(s)"
+printf "  %s: %s\n" "${RED}FAIL ${RESET}"  "${FAIL_COUNT} camera(s)"
+printf "%s\n" "${BOLD}────────────────────────────────────────${RESET}"
 
 if [[ "$FAIL_COUNT" -gt 0 ]]; then
     exit 2
