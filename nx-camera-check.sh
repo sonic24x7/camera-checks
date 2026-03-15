@@ -273,7 +273,7 @@ while IFS= read -r cam_id; do
         bitrate_label="${bitrate} kbps"
     elif [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
         bitrate_kbps=$(awk "BEGIN {printf \"%d\", ${actual_bitrate_mbps} * 1024}")
-        bitrate_label="${actual_bitrate_mbps} Mbps  (actual)"
+        bitrate_label="$(printf '%.2f' "${actual_bitrate_mbps}") Mbps  (actual)"
     else
         bitrate_kbps=0
         bitrate_label="unknown"
@@ -353,7 +353,7 @@ while IFS= read -r cam_id; do
 
     # Bitrate
     if [[ "$bitrate_kbps" -gt 4096 ]] 2>/dev/null; then
-        status_line "Bitrate" "AMBER" "${bitrate_label}  (>4096 kbps)"
+        status_line "Bitrate" "AMBER" "${bitrate_label}  (>4 Mbps)"
         cam_warn=1
     elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
         status_line "Bitrate" "GREEN" "${bitrate_label}"
@@ -361,6 +361,37 @@ while IFS= read -r cam_id; do
         status_line "Bitrate" "AMBER" "unknown"
         cam_warn=1
     fi
+
+    # 4G impact note — evidence retrieval speed over 4G
+    if [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
+        _4g_mbps="$actual_bitrate_mbps"
+    elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
+        _4g_mbps=$(awk "BEGIN {printf \"%.6f\", ${bitrate_kbps} / 1024}")
+    else
+        _4g_mbps="0"
+    fi
+    _4g_tier=$(awk -v b="${_4g_mbps}" 'BEGIN {
+        if (b <= 0)    print "unknown"
+        else if (b < 2) print "good"
+        else if (b < 4) print "acceptable"
+        else if (b < 8) print "high"
+        else            print "veryhigh"
+    }')
+    case "$_4g_tier" in
+        good)
+            status_line "4G Impact" "GREEN" "Good for 4G download" ;;
+        acceptable)
+            status_line "4G Impact" "GREEN" "Acceptable for 4G download" ;;
+        high)
+            status_line "4G Impact" "AMBER" "High for 4G — expect slow evidence downloads"
+            cam_warn=1 ;;
+        veryhigh)
+            status_line "4G Impact" "RED" "Very high — 4G evidence download will be very slow"
+            cam_fail=1 ;;
+        *)
+            status_line "4G Impact" "AMBER" "unknown bitrate"
+            cam_warn=1 ;;
+    esac
 
     # Tally
     if [[ "$cam_fail" -gt 0 ]]; then
