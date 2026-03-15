@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # nx-camera-check.sh — Check Nx Witness v6.1 camera recording settings
-# Dependencies: curl, bash (no jq required)
+# Dependencies: curl, python3, bash (no jq required)
 
 set -euo pipefail
 set +H  # Disable history expansion so ! in passwords is safe
@@ -168,15 +168,31 @@ elif [[ "$HTTP_CODE" != "200" ]]; then
     exit 1
 fi
 
-# ── Parse device list ─────────────────────────────────────────────────────────
-# The response is a JSON array of device objects.
-# Split on top-level object boundaries — each device starts with {"id":
-# We use awk to split the array into one device JSON blob per line.
+# ── Extract camera IDs from device list ───────────────────────────────────────
+# Use python3 to reliably parse the JSON array (objects are too large/nested
+# for awk-based splitting). We only need the id field from Camera entries.
 
-DEVICES_RAW=$(echo "$HTTP_BODY" | \
-    awk 'BEGIN{RS="\\},\\s*\\{";ORS="\n"} {gsub(/^\s*\[?\s*\{/,"{",$0); gsub(/\}\s*\]?\s*$/,"}",$0); print}')
+if ! command -v python3 &>/dev/null; then
+    echo -e "${RED}ERROR: python3 is required for JSON parsing.${RESET}" >&2
+    exit 1
+fi
 
-DEVICE_COUNT=$(echo "$DEVICES_RAW" | grep -cP '"deviceType"\s*:\s*"Camera"') || true
+CAMERA_IDS=$(echo "$HTTP_BODY" | python3 -c "
+import json, sys
+try:
+    devices = json.load(sys.stdin)
+    for d in devices:
+        if d.get('deviceType') == 'Camera':
+            print(d['id'])
+except Exception as e:
+    sys.stderr.write('JSON parse error: ' + str(e) + '\n')
+    sys.exit(1)
+") || {
+    echo -e "${RED}ERROR: Failed to parse device list JSON.${RESET}" >&2
+    exit 1
+}
+
+DEVICE_COUNT=$(echo "$CAMERA_IDS" | grep -c '.') || true
 
 if [[ "$DEVICE_COUNT" -eq 0 ]]; then
     echo -e "${AMBER}No cameras found in the response.${RESET}"
@@ -185,18 +201,33 @@ fi
 
 echo -e "${BOLD}Found ${DEVICE_COUNT} camera(s).${RESET}\n"
 
-# ── Process each device ───────────────────────────────────────────────────────
+# ── Process each camera via individual API call ────────────────────────────────
+# Fetching /rest/v3/devices/{id} returns a single device object which is
+# reliable to parse — collapse to one line then apply targeted grep patterns.
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
 
-while IFS= read -r device_json; do
-    [[ -z "$device_json" ]] && continue
-    [[ "$device_json" != *'"id"'* ]] && continue
+while IFS= read -r cam_id; do
+    [[ -z "$cam_id" ]] && continue
 
-    # Only process Camera-type devices; skip servers, NVRs, etc.
-    dev_type=$(extract "$device_json" "deviceType")
-    [[ "$dev_type" != "Camera" ]] && continue
+    DEV_RESPONSE=$(curl -sk -w "\n__STATUS__%{http_code}" \
+        -H "Authorization: Bearer ${NX_TOKEN}" \
+        "${BASE_URL}/rest/v3/devices/${cam_id}") || {
+        echo -e "${AMBER}WARNING: curl failed for device ${cam_id}, skipping.${RESET}" >&2
+        continue
+    }
+
+    DEV_BODY=$(echo "$DEV_RESPONSE" | sed -n '/^__STATUS__/!p')
+    DEV_CODE=$(echo "$DEV_RESPONSE" | grep -oP '(?<=__STATUS__)\d+')
+
+    if [[ "$DEV_CODE" != "200" ]]; then
+        echo -e "${AMBER}WARNING: HTTP ${DEV_CODE} for device ${cam_id}, skipping.${RESET}" >&2
+        continue
+    fi
+
+    # Collapse to a single line so all grep patterns work regardless of formatting
+    device_json=$(echo "$DEV_BODY" | tr -d '\n' | tr -s ' ')
 
     # Basic fields
     cam_name=$(extract "$device_json" "name")
@@ -342,7 +373,7 @@ while IFS= read -r device_json; do
 
     echo
 
-done <<< "$DEVICES_RAW"
+done <<< "$CAMERA_IDS"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "${BOLD}────────────────────────────────────────${RESET}"
