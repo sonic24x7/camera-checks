@@ -273,11 +273,13 @@ while IFS= read -r cam_id; do
     streams_raw=$(echo "$device_json" | grep -oP '"streams"\s*:\s*\[\K[^\]]*' | head -1)
     actual_bitrate_mbps=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "actualBitrate")
 
-    # Effective bitrate for threshold comparison:
-    #   bitrateKbps=0 means NX is managing bitrate automatically — show actual current value
+    # Effective bitrate — always convert to Mbps for display and comparison.
+    # When bitrateKbps is configured (>0) derive Mbps from it directly so that
+    # the displayed value, threshold, and storage estimate are all consistent.
+    # Only fall back to bitrateInfos.actualBitrate when NX is in auto mode (0).
     if [[ "$bitrate" -gt 0 ]] 2>/dev/null; then
         bitrate_kbps="$bitrate"
-        bitrate_label="${bitrate} kbps"
+        bitrate_label="$(awk "BEGIN {printf \"%.2f\", ${bitrate} / 1024}") Mbps"
     elif [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
         bitrate_kbps=$(awk "BEGIN {printf \"%d\", ${actual_bitrate_mbps} * 1024}")
         bitrate_label="$(printf '%.2f' "${actual_bitrate_mbps}") Mbps  (actual)"
@@ -370,10 +372,10 @@ while IFS= read -r cam_id; do
     esac
 
     # Bitrate — resolve to Mbps for all severity and estimate calculations
-    if [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
-        _bmps="$actual_bitrate_mbps"
-    elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
+    if [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
         _bmps=$(awk "BEGIN {printf \"%.6f\", ${bitrate_kbps} / 1024}")
+    elif [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
+        _bmps="$actual_bitrate_mbps"
     else
         _bmps="0"
     fi
@@ -397,7 +399,7 @@ while IFS= read -r cam_id; do
         read -r _daily_gb _d30_gb _d30_tb _hr_gb _dl_min < <(awk -v b="$_bmps" 'BEGIN {
             daily = b * 86400 / 8 / 1000
             d30   = daily * 30
-            tb30  = d30 / 1000
+            tb30  = d30 / 1024
             hr    = b * 3600 / 8 / 1000
             dlm   = b * 3
             printf "%.1f %.0f %.2f %.2f %.0f\n", daily, d30, tb30, hr, dlm
