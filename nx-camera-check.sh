@@ -46,10 +46,11 @@ status_line() {
     local value="$3"
     local tag
     case "$colour" in
-        GREEN) tag="${GREEN}[OK]${RESET}" ;;
+        GREEN) tag="${GREEN}[OK]${RESET}"   ;;
         AMBER) tag="${AMBER}[WARN]${RESET}" ;;
-        RED)   tag="${RED}[FAIL]${RESET}" ;;
-        *)     tag="[????]" ;;
+        RED)   tag="${RED}[FAIL]${RESET}"   ;;
+        INFO)  tag="[INFO]"                 ;;
+        *)     tag="[????]"                 ;;
     esac
     printf "  %-14s %s %s\n" "${label}:" "$tag" "$value"
 }
@@ -336,6 +337,17 @@ while IFS= read -r cam_id; do
             cam_warn=1 ;;
     esac
 
+    # Codec note
+    case "$codec" in
+        H.264)
+            printf "  %-14s %s\n" "Codec note:" "H.265 offers ~50-60% bitrate saving at 1080p but risks"
+            printf "  %-14s %s\n" "" "missing fast motion at low bitrate — not recommended for"
+            printf "  %-14s %s\n" "" "court evidence footage. Stay on H.264 at 3-4Mbps." ;;
+        H.265)
+            printf "  %-14s %s %s\n" "Codec note:" "${GREEN}[OK]${RESET}" "H.265 active — keep bitrate above 3Mbps to ensure"
+            printf "  %-14s %s\n"    ""             "reliable motion capture for evidence integrity." ;;
+    esac
+
     # Stream quality
     case "$quality" in
         highest|high)
@@ -351,47 +363,69 @@ while IFS= read -r cam_id; do
             cam_warn=1 ;;
     esac
 
-    # Bitrate
-    if [[ "$bitrate_kbps" -gt 4096 ]] 2>/dev/null; then
-        status_line "Bitrate" "AMBER" "${bitrate_label}  (>4 Mbps)"
-        cam_warn=1
+    # Bitrate — resolve to Mbps for all severity and estimate calculations
+    if [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
+        _bmps="$actual_bitrate_mbps"
     elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
-        status_line "Bitrate" "GREEN" "${bitrate_label}"
+        _bmps=$(awk "BEGIN {printf \"%.6f\", ${bitrate_kbps} / 1024}")
     else
-        status_line "Bitrate" "AMBER" "unknown"
-        cam_warn=1
+        _bmps="0"
     fi
 
-    # 4G impact note — evidence retrieval speed over 4G
-    if [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
-        _4g_mbps="$actual_bitrate_mbps"
-    elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
-        _4g_mbps=$(awk "BEGIN {printf \"%.6f\", ${bitrate_kbps} / 1024}")
-    else
-        _4g_mbps="0"
-    fi
-    _4g_tier=$(awk -v b="${_4g_mbps}" 'BEGIN {
+    # Bitrate line — thresholds: <4 Mbps OK, 4-8 WARN, >8 FAIL
+    _btier=$(awk -v b="$_bmps" 'BEGIN {
         if (b <= 0)    print "unknown"
-        else if (b < 2) print "good"
-        else if (b < 4) print "acceptable"
-        else if (b < 8) print "high"
-        else            print "veryhigh"
+        else if (b < 4) print "ok"
+        else if (b < 8) print "warn"
+        else            print "fail"
     }')
-    case "$_4g_tier" in
-        good)
-            status_line "4G Impact" "GREEN" "Good for 4G download" ;;
-        acceptable)
-            status_line "4G Impact" "GREEN" "Acceptable for 4G download" ;;
-        high)
-            status_line "4G Impact" "AMBER" "High for 4G — expect slow evidence downloads"
-            cam_warn=1 ;;
-        veryhigh)
-            status_line "4G Impact" "RED" "Very high — 4G evidence download will be very slow"
-            cam_fail=1 ;;
-        *)
-            status_line "4G Impact" "AMBER" "unknown bitrate"
-            cam_warn=1 ;;
+    case "$_btier" in
+        ok)      status_line "Bitrate" "GREEN" "${bitrate_label}" ;;
+        warn)    status_line "Bitrate" "AMBER" "${bitrate_label}"; cam_warn=1 ;;
+        fail)    status_line "Bitrate" "RED"   "${bitrate_label}"; cam_fail=1 ;;
+        *)       status_line "Bitrate" "AMBER" "unknown";          cam_warn=1 ;;
     esac
+
+    # Storage estimate and 4G download time (skipped if bitrate unknown)
+    if awk -v b="$_bmps" 'BEGIN {exit (b > 0) ? 0 : 1}'; then
+        read -r _daily_gb _d30_gb _d30_tb _hr_gb _dl_min < <(awk -v b="$_bmps" 'BEGIN {
+            daily = b * 86400 / 8 / 1000
+            d30   = daily * 30
+            tb30  = d30 / 1000
+            hr    = b * 3600 / 8 / 1000
+            dlm   = b * 3
+            printf "%.1f %.0f %.2f %.2f %.0f\n", daily, d30, tb30, hr, dlm
+        }')
+
+        # Storage est line
+        _store_colour="INFO"
+        _store_note="2TB NVMe — OK"
+        if [[ "$_d30_gb" -gt 2000 ]] 2>/dev/null; then
+            _store_colour="RED"
+            _store_note="Exceeds 2TB NVMe — reduce bitrate or retention period"
+            cam_fail=1
+        elif [[ "$_d30_gb" -gt 1800 ]] 2>/dev/null; then
+            _store_colour="AMBER"
+            _store_note="Approaching 2TB NVMe limit"
+            cam_warn=1
+        fi
+        status_line "Storage est" "${_store_colour}" \
+            "~${_daily_gb} GB/day  ~${_d30_tb} TB/30 days  (${_store_note})"
+
+        # 4G download line — same severity tier as bitrate
+        case "$_btier" in
+            ok)   _4g_col="GREEN" ;;
+            warn) _4g_col="AMBER" ;;
+            fail) _4g_col="RED"   ;;
+            *)    _4g_col="AMBER" ;;
+        esac
+        status_line "4G download" "${_4g_col}" \
+            "1hr footage ≈ ${_hr_gb}GB — approx ${_dl_min}min on 4G"
+
+        # Recommended target — static guidance, no status tag
+        printf "  %-14s %s\n" "Recommended:" \
+            "Target 3-4 Mbps — at 4Mbps: ~43GB/day ~1.3TB/30 days"
+    fi
 
     # Tally
     if [[ "$cam_fail" -gt 0 ]]; then
