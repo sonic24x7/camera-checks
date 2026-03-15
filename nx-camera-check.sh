@@ -8,11 +8,11 @@ set +H  # Disable history expansion so ! in passwords is safe
 BASE_URL="https://localhost:7001"
 
 # ── Colour codes ──────────────────────────────────────────────────────────────
-GREEN='\033[0;32m'
-AMBER='\033[0;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-RESET='\033[0m'
+GREEN=$'\033[0;32m'
+AMBER=$'\033[0;33m'
+RED=$'\033[0;31m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 NX_USER=""
@@ -252,28 +252,28 @@ while IFS= read -r cam_id; do
     bitrate=$(echo "$sched_info"  | cut -d'|' -f3)
     quality=$(echo "$sched_info"  | cut -d'|' -f4)
 
-    # Resolution and actual bitrate — parameters.bitrateInfos.streams where encoderIndex=primary
-    streams_raw=$(echo "$device_json" | grep -oP '"streams"\s*:\s*\[\K[^\]]*' | head -1)
-    resolution=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "resolution")
-    actual_bitrate_mbps=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "actualBitrate")
+    # Resolution and codec — mediaStreams where encoderIndex=0 (primary recorded stream)
+    media_streams_raw=$(echo "$device_json" | grep -oP '"mediaStreams"\s*:\s*\[\K[^\]]*' | head -1)
+    resolution=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "resolution")
+    codec_raw=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "codec")
+    codec=$(map_codec "$codec_raw")
     res_width=0
     if [[ "$resolution" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
         res_width="${BASH_REMATCH[1]}"
     fi
 
-    # Codec — mediaStreams where encoderIndex=0 (primary stream)
-    media_streams_raw=$(echo "$device_json" | grep -oP '"mediaStreams"\s*:\s*\[\K[^\]]*' | head -1)
-    codec_raw=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "codec")
-    codec=$(map_codec "$codec_raw")
+    # Actual bitrate — parameters.bitrateInfos.streams where encoderIndex=primary (Mbps)
+    streams_raw=$(echo "$device_json" | grep -oP '"streams"\s*:\s*\[\K[^\]]*' | head -1)
+    actual_bitrate_mbps=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "actualBitrate")
 
     # Effective bitrate for threshold comparison:
-    #   bitrateKbps=0 means auto — use actualBitrate (Mbps) * 1024 instead
+    #   bitrateKbps=0 means NX is managing bitrate automatically — show actual current value
     if [[ "$bitrate" -gt 0 ]] 2>/dev/null; then
         bitrate_kbps="$bitrate"
         bitrate_label="${bitrate} kbps"
     elif [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
         bitrate_kbps=$(awk "BEGIN {printf \"%d\", ${actual_bitrate_mbps} * 1024}")
-        bitrate_label="${actual_bitrate_mbps} Mbps  (auto)"
+        bitrate_label="${actual_bitrate_mbps} Mbps  (actual)"
     else
         bitrate_kbps=0
         bitrate_label="unknown"
