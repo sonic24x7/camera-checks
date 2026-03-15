@@ -3,6 +3,7 @@
 # Dependencies: curl, bash (no jq required)
 
 set -euo pipefail
+set +H  # Disable history expansion so ! in passwords is safe
 
 BASE_URL="https://localhost:7001"
 
@@ -62,51 +63,65 @@ extract() {
     echo "$json" | grep -oP "\"${key}\"\s*:\s*\K(\"[^\"]*\"|[^,\}\]\s]+)" | head -1 | tr -d '"'
 }
 
-# Extract a block between the Nth occurrence of a pattern (used for scheduleTasks)
-# Returns the content between balanced braces for each task object
-extract_schedule_tasks() {
-    local json="$1"
-    # Pull everything inside "scheduleTasks": [ ... ]
-    echo "$json" | grep -oP '"scheduleTasks"\s*:\s*\[\K[^\]]*'
+# Split a JSON array of objects (by },{) and return the value of target_key
+# from the first object where match_key == match_val.
+# Usage: extract_stream_field array_json match_key match_val target_key
+extract_stream_field() {
+    local array_json="$1"
+    local match_key="$2"
+    local match_val="$3"
+    local target_key="$4"
+    local obj
+    while IFS= read -r obj; do
+        [[ -z "$obj" ]] && continue
+        local val
+        val=$(extract "$obj" "$match_key")
+        if [[ "$val" == "$match_val" ]]; then
+            extract "$obj" "$target_key"
+            return
+        fi
+    done < <(echo "$array_json" | awk 'BEGIN{RS="\\},\\s*\\{"} {print "{" $0 "}"}' \
+        | sed 's/^\s*{\s*{/{/' | sed 's/}\s*}\s*$/}/')
 }
 
-# From a scheduleTasks array string, get the "most active" recordingType:
-#   always > motionOnly > never
-# Also pull fps and bitrateKbps from the first task that isn't "never"
+# Map a raw codec value (numeric ID or string) to a human label
+map_codec() {
+    local raw="$1"
+    case "$raw" in
+        173|H264|AVC)  echo "H.264" ;;
+        174|H265|HEVC) echo "H.265" ;;
+        0)             echo "transcoded/unknown" ;;
+        *)             [[ -n "$raw" ]] && echo "unknown (${raw})" || echo "unknown" ;;
+    esac
+}
+
+# From a schedule.tasks array, use dayOfWeek=1 as the canonical day
+# (all days share the same settings). Returns: type|fps|bitrateKbps|streamQuality
 parse_schedule() {
     local tasks_json="$1"
-    local best_type="never"
-    local best_fps=0
-    local best_bitrate=0
+    local rec_type="never"
+    local rec_fps=0
+    local rec_bitrate=0
+    local rec_quality="unknown"
 
-    # Split into individual objects by splitting on "},{"
-    local IFS_ORIG="$IFS"
-    # Use awk to split task objects
     local task
     while IFS= read -r task; do
         [[ -z "$task" ]] && continue
-        local rtype fps bitrate
-        rtype=$(extract "$task" "recordingType")
-        fps=$(extract "$task" "fps")
-        bitrate=$(extract "$task" "bitrateKbps")
-        fps=${fps:-0}
-        bitrate=${bitrate:-0}
+        local dow
+        dow=$(extract "$task" "dayOfWeek")
+        [[ "$dow" != "1" ]] && continue
+        rec_type=$(extract "$task" "recordingType")
+        rec_fps=$(extract "$task" "fps")
+        rec_bitrate=$(extract "$task" "bitrateKbps")
+        rec_quality=$(extract "$task" "streamQuality")
+        rec_fps=${rec_fps:-0}
+        rec_bitrate=${rec_bitrate:-0}
+        rec_quality=${rec_quality:-unknown}
+        break
+    done < <(echo "$tasks_json" | awk 'BEGIN{RS="\\},\\s*\\{"} {print "{" $0 "}"}' \
+        | sed 's/^\s*{\s*{/{/' | sed 's/}\s*}\s*$/}/')
 
-        # Priority: always > motionOnly > never
-        if [[ "$rtype" == "always" ]]; then
-            best_type="always"
-            best_fps="$fps"
-            best_bitrate="$bitrate"
-            break  # can't do better
-        elif [[ "$rtype" == "motionOnly" && "$best_type" == "never" ]]; then
-            best_type="motionOnly"
-            best_fps="$fps"
-            best_bitrate="$bitrate"
-        fi
-    done < <(echo "$tasks_json" | awk 'BEGIN{RS="\\},\\s*\\{"} {print "{" $0 "}"}' | sed 's/^\s*{\s*{/{/' | sed 's/}\s*}\s*$/}/')
-
-    IFS="$IFS_ORIG"
-    echo "${best_type}|${best_fps}|${best_bitrate}"
+    echo "${rec_type}|${rec_fps}|${rec_bitrate}|${rec_quality}"
 }
 
 # ── Login — obtain bearer token ───────────────────────────────────────────────
@@ -161,14 +176,14 @@ fi
 DEVICES_RAW=$(echo "$HTTP_BODY" | \
     awk 'BEGIN{RS="\\},\\s*\\{";ORS="\n"} {gsub(/^\s*\[?\s*\{/,"{",$0); gsub(/\}\s*\]?\s*$/,"}",$0); print}')
 
-DEVICE_COUNT=$(echo "$DEVICES_RAW" | grep -c '"id"') || true
+DEVICE_COUNT=$(echo "$DEVICES_RAW" | grep -cP '"deviceType"\s*:\s*"Camera"') || true
 
 if [[ "$DEVICE_COUNT" -eq 0 ]]; then
     echo -e "${AMBER}No cameras found in the response.${RESET}"
     exit 0
 fi
 
-echo -e "${BOLD}Found ${DEVICE_COUNT} device(s).${RESET}\n"
+echo -e "${BOLD}Found ${DEVICE_COUNT} camera(s).${RESET}\n"
 
 # ── Process each device ───────────────────────────────────────────────────────
 PASS_COUNT=0
@@ -177,8 +192,11 @@ FAIL_COUNT=0
 
 while IFS= read -r device_json; do
     [[ -z "$device_json" ]] && continue
-    # Skip entries that don't look like a camera device
     [[ "$device_json" != *'"id"'* ]] && continue
+
+    # Only process Camera-type devices; skip servers, NVRs, etc.
+    dev_type=$(extract "$device_json" "deviceType")
+    [[ "$dev_type" != "Camera" ]] && continue
 
     # Basic fields
     cam_name=$(extract "$device_json" "name")
@@ -189,34 +207,46 @@ while IFS= read -r device_json; do
     [[ -z "$cam_name" ]] && cam_name="(unknown)"
     [[ -z "$cam_ip" ]] && cam_ip="(unknown)"
 
-    # Resolution — look for "resolution" key (e.g. "1920x1080")
-    resolution=$(extract "$device_json" "resolution")
-    # Also try resolutionList — take the first entry
-    if [[ -z "$resolution" ]]; then
-        resolution=$(echo "$device_json" | grep -oP '"resolutionList"\s*:\s*\[\s*"\K[^"]+' | head -1)
+    # schedule.isEnabled
+    sched_enabled=$(echo "$device_json" | grep -oP '"isEnabled"\s*:\s*\K(true|false)' | head -1)
+
+    # schedule.tasks — extract array content, parse day 1
+    tasks_raw=$(echo "$device_json" | grep -oP '"tasks"\s*:\s*\[\K[^\]]*' | head -1)
+    sched_info="never|0|0|unknown"
+    if [[ -n "$tasks_raw" ]]; then
+        sched_info=$(parse_schedule "$tasks_raw")
     fi
+    rec_type=$(echo "$sched_info" | cut -d'|' -f1)
+    fps=$(echo "$sched_info"      | cut -d'|' -f2)
+    bitrate=$(echo "$sched_info"  | cut -d'|' -f3)
+    quality=$(echo "$sched_info"  | cut -d'|' -f4)
+
+    # Resolution and actual bitrate — parameters.bitrateInfos.streams where encoderIndex=primary
+    streams_raw=$(echo "$device_json" | grep -oP '"streams"\s*:\s*\[\K[^\]]*' | head -1)
+    resolution=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "resolution")
+    actual_bitrate_mbps=$(extract_stream_field "$streams_raw" "encoderIndex" "primary" "actualBitrate")
     res_width=0
     if [[ "$resolution" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
         res_width="${BASH_REMATCH[1]}"
     fi
 
-    # Codec
-    codec=$(extract "$device_json" "codec")
-    [[ -z "$codec" ]] && codec=$(extract "$device_json" "streamCodec")
-    [[ -z "$codec" ]] && codec="unknown"
+    # Codec — mediaStreams where encoderIndex=0 (primary stream)
+    media_streams_raw=$(echo "$device_json" | grep -oP '"mediaStreams"\s*:\s*\[\K[^\]]*' | head -1)
+    codec_raw=$(extract_stream_field "$media_streams_raw" "encoderIndex" "0" "codec")
+    codec=$(map_codec "$codec_raw")
 
-    # scheduleEnabled
-    sched_enabled=$(extract "$device_json" "scheduleEnabled")
-
-    # scheduleTasks
-    tasks_raw=$(extract_schedule_tasks "$device_json")
-    sched_info="never|0|0"
-    if [[ -n "$tasks_raw" ]]; then
-        sched_info=$(parse_schedule "$tasks_raw")
+    # Effective bitrate for threshold comparison:
+    #   bitrateKbps=0 means auto — use actualBitrate (Mbps) * 1024 instead
+    if [[ "$bitrate" -gt 0 ]] 2>/dev/null; then
+        bitrate_kbps="$bitrate"
+        bitrate_label="${bitrate} kbps"
+    elif [[ -n "$actual_bitrate_mbps" && "$actual_bitrate_mbps" != "0" ]]; then
+        bitrate_kbps=$(awk "BEGIN {printf \"%d\", ${actual_bitrate_mbps} * 1024}")
+        bitrate_label="${actual_bitrate_mbps} Mbps  (auto)"
+    else
+        bitrate_kbps=0
+        bitrate_label="unknown"
     fi
-    rec_type=$(echo "$sched_info" | cut -d'|' -f1)
-    fps=$(echo "$sched_info" | cut -d'|' -f2)
-    bitrate=$(echo "$sched_info" | cut -d'|' -f3)
 
     # ── Print header ──────────────────────────────────────────────────────────
     echo -e "${BOLD}=== Camera: ${cam_name} (${cam_ip}) ===${RESET}"
@@ -267,22 +297,35 @@ while IFS= read -r device_json; do
     fi
 
     # Codec
-    codec_upper=$(echo "$codec" | tr '[:lower:]' '[:upper:]')
-    if [[ "$codec_upper" == *"H264"* || "$codec_upper" == *"H.264"* || \
-          "$codec_upper" == *"H265"* || "$codec_upper" == *"H.265"* || \
-          "$codec_upper" == *"HEVC"* || "$codec_upper" == *"AVC"* ]]; then
-        status_line "Codec" "GREEN" "$codec"
-    else
-        status_line "Codec" "AMBER" "${codec}  (not H.264/H.265)"
-        cam_warn=1
-    fi
+    case "$codec" in
+        H.264|H.265)
+            status_line "Codec" "GREEN" "$codec" ;;
+        *)
+            status_line "Codec" "AMBER" "${codec}  (not H.264/H.265)"
+            cam_warn=1 ;;
+    esac
+
+    # Stream quality
+    case "$quality" in
+        highest|high)
+            status_line "Quality" "GREEN" "$quality" ;;
+        medium)
+            status_line "Quality" "AMBER" "$quality"
+            cam_warn=1 ;;
+        low)
+            status_line "Quality" "RED" "low"
+            cam_fail=1 ;;
+        *)
+            status_line "Quality" "AMBER" "${quality:-unknown}"
+            cam_warn=1 ;;
+    esac
 
     # Bitrate
-    if [[ "$bitrate" -gt 4096 ]] 2>/dev/null; then
-        status_line "Bitrate" "AMBER" "${bitrate} kbps  (>4096)"
+    if [[ "$bitrate_kbps" -gt 4096 ]] 2>/dev/null; then
+        status_line "Bitrate" "AMBER" "${bitrate_label}  (>4096 kbps)"
         cam_warn=1
-    elif [[ "$bitrate" -gt 0 ]] 2>/dev/null; then
-        status_line "Bitrate" "GREEN" "${bitrate} kbps"
+    elif [[ "$bitrate_kbps" -gt 0 ]] 2>/dev/null; then
+        status_line "Bitrate" "GREEN" "${bitrate_label}"
     else
         status_line "Bitrate" "AMBER" "unknown"
         cam_warn=1
